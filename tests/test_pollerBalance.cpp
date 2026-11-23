@@ -3,10 +3,12 @@
 #include <functional>
 #include <iostream>
 #include <vector>
+#if defined(__linux) || defined(__linux__)
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#endif
 #include "Util/logger.h"
 #include "Network/TcpServer.h"
 #include "Network/Session.h"
@@ -22,13 +24,13 @@ public:
     void onManager() override {}
 };
 
-static int connectMany(int count, vector<int> &fds) {
+static int connectMany(int count, vector<int> &fds, int port) {
     int ok = 0;
     for (int i = 0; i < count; ++i) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(9011);
+        addr.sin_port = htons(port);
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (connect(fd, (sockaddr *)&addr, sizeof(addr)) == 0) {
             fds.push_back(fd);
@@ -70,13 +72,13 @@ int main(int argc, char *argv[]) {
     EventPollerPool::setPoolSize(threads);
 
     TcpServer::Ptr server(new TcpServer());
-    server->start<EchoSession>(9011);
+    server->start<EchoSession>(0, "127.0.0.1");
     auto pollers = allPollers();
 
     // 阶段1: 全部空闲, 突发连接应按fd数均分
     // Stage 1: all idle, a burst should be split evenly by fd count
     vector<int> fds;
-    connectMany(conns, fds);
+    connectMany(conns, fds, server->getPort());
     this_thread::sleep_for(chrono::seconds(1));
 
     size_t total = 0, maxv = 0, minv = SIZE_MAX;
@@ -103,7 +105,7 @@ int main(int argc, char *argv[]) {
     for (auto &p : pollers) {
         before.push_back(p->fdCount());
     }
-    connectMany(conns / 4, fds);
+    connectMany(conns / 4, fds, server->getPort());
     this_thread::sleep_for(chrono::seconds(1));
     *busy = false;
 
