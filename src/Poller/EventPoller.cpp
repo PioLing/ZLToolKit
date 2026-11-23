@@ -12,6 +12,7 @@
 #include "EventPoller.h"
 #include "Util/util.h"
 #include "Util/uv_errno.h"
+#include <algorithm>
 #include "Util/TimeTicker.h"
 #include "Util/NoticeCenter.h"
 #include "Network/sockutil.h"
@@ -707,23 +708,58 @@ EventPoller::Ptr EventPollerPool::getPoller(bool prefer_current_thread) {
 
     auto size = _threads.size();
 
-    // 以fd数(含Socket已预约未attach的fd)作为负载指标: 即时且确定, 避免ThreadLoadCounter滞后导致突发连接集中到同一线程
-    // 起始位置轮转, fd数相同时实现round-robin
-    // Use fd count (including fds reserved by Sockets but not yet attached) as the load metric: immediate and
-    // deterministic, avoiding bursts piling onto one thread due to the lagging ThreadLoadCounter.
-    // Rotate the start position so ties are round-robin.
+    // 两级选择:
+    // 1. 以fd数(含Socket已预约未attach的fd)为主指标: 即时且确定, 避免ThreadLoadCounter滞后导致突发连接集中到同一线程
+    // 2. fd数与最小值相差在阈值内的poller视为"fd数相近", 在这些候选中再比较cpu负载load(),
+    //    避免长连接数均匀但各连接cpu消耗差异大(如不同码率的流)导致的cpu不均
+    // 起始位置轮转, 两项指标都相同时实现round-robin
+    // Two-stage selection:
+    // 1. fd count (including fds reserved by Sockets but not yet attached) as the primary metric: immediate and
+    //    deterministic, avoiding bursts piling onto one thread due to the lagging ThreadLoadCounter.
+    // 2. pollers whose fd count is within the threshold of the minimum are considered "close"; among those
+    //    candidates compare cpu load(), so that evenly distributed but unevenly expensive connections
+    //    (e.g. streams of different bitrates) still get cpu-balanced.
+    // Rotate the start position so full ties are round-robin.
     auto start = _poller_pos.fetch_add(1, std::memory_order_relaxed) % size;
-    EventPoller *min_poller = nullptr;
-    size_t min_fd = 0;
+
+    // 第一遍: 仅原子读, 求最小fd数
+    // Pass 1: atomic reads only, find the minimum fd count
+    size_t min_fd = SIZE_MAX;
+    for (auto &th : _threads) {
+        auto poller = static_cast<EventPoller *>(th.get());
+        min_fd = std::min(min_fd, poller->fdCount() + poller->pendingFdCount());
+    }
+
+    // 阈值取绝对值与百分比中的较大者: 连接数少时允许一定绝对偏差, 连接数多时按比例放宽
+    // Threshold is the larger of the absolute and the percentage value
+    auto threshold = std::max<size_t>(_fd_balance_threshold, min_fd * _fd_balance_threshold_percent / 100);
+
+    // 第二遍: 仅对fd数相近的候选调用load()(有锁), 避免每次accept都遍历所有线程的负载记录
+    // Pass 2: call load() (which locks) only for close candidates
+    EventPoller *best = nullptr;
+    int best_load = 0;
     for (size_t i = 0; i < size; ++i) {
-        auto th = static_cast<EventPoller *>(_threads[(start + i) % size].get());
-        auto fd = th->fdCount() + th->pendingFdCount();
-        if (!min_poller || fd < min_fd) {
-            min_poller = th;
-            min_fd = fd;
+        auto poller = static_cast<EventPoller *>(_threads[(start + i) % size].get());
+        if (poller->fdCount() + poller->pendingFdCount() > min_fd + threshold) {
+            continue;
+        }
+        auto load = poller->load();
+        if (!best || load < best_load) {
+            best = poller;
+            best_load = load;
         }
     }
-    return static_pointer_cast<EventPoller>(min_poller->shared_from_this());
+    if (!best) {
+        // fd数在两遍之间增长导致无候选(极少见), 退化为轮询
+        // fd counts grew between the passes leaving no candidate (rare); fall back to round-robin
+        best = static_cast<EventPoller *>(_threads[start].get());
+    }
+    return static_pointer_cast<EventPoller>(best->shared_from_this());
+}
+
+void EventPollerPool::setFdBalanceThreshold(size_t absolute, size_t percent) {
+    _fd_balance_threshold = absolute;
+    _fd_balance_threshold_percent = percent;
 }
 
 void EventPollerPool::preferCurrentThread(bool flag) {

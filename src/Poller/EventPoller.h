@@ -417,12 +417,14 @@ public:
     EventPoller::Ptr getFirstPoller();
 
     /**
-     * 获取轻负载的实例，以监听的fd数(含已预约未attach的fd)最少为准，fd数相同时轮询
+     * 获取轻负载的实例：先按监听的fd数(含已预约未attach的fd)筛选，fd数与最小值相差在阈值内的候选再按cpu负载比较，
+     * 两项都相同时轮询。阈值见 setFdBalanceThreshold
      * 如果优先返回当前线程，那么会返回当前线程
      * 返回当前线程的目的是为了提高线程安全性
      * @param prefer_current_thread 是否优先获取当前线程
-     * Get a lightly loaded instance, measured by fd count (including reserved-but-not-yet-attached fds);
-     * ties are broken round-robin
+     * Get a lightly loaded instance: filter by fd count (including reserved-but-not-yet-attached fds), then among
+     * candidates within the threshold of the minimum compare cpu load; full ties are broken round-robin.
+     * See setFdBalanceThreshold for the threshold
      * If prioritizing the current thread, it will return the current thread
      * The purpose of returning the current thread is to improve thread safety
      * @param prefer_current_thread Whether to prioritize getting the current thread
@@ -443,12 +445,26 @@ public:
      */
     void preferCurrentThread(bool flag = true);
 
+    /**
+     * 设置 getPoller() 判定"fd数相近"的阈值，实际阈值 = max(absolute, min_fd * percent / 100)
+     * fd数在 [min_fd, min_fd + 阈值] 内的poller会进一步比较cpu负载
+     * @param absolute 绝对阈值(fd个数)
+     * @param percent 相对阈值(百分比)
+     * Set the threshold used by getPoller() to treat fd counts as "close": max(absolute, min_fd * percent / 100).
+     * Pollers within [min_fd, min_fd + threshold] are further compared by cpu load.
+     * @param absolute Absolute threshold in fds
+     * @param percent Relative threshold in percent
+     */
+    void setFdBalanceThreshold(size_t absolute, size_t percent);
+
 private:
     EventPollerPool();
 
 private:
     bool _prefer_current_thread = true;
     std::atomic<size_t> _poller_pos { 0 };
+    size_t _fd_balance_threshold = 8;
+    size_t _fd_balance_threshold_percent = 10;
 };
 
 } // namespace toolkit
