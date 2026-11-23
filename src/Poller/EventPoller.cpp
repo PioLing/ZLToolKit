@@ -727,7 +727,7 @@ EventPoller::Ptr EventPollerPool::getPoller(bool prefer_current_thread) {
     size_t min_fd = SIZE_MAX;
     for (auto &th : _threads) {
         auto poller = static_cast<EventPoller *>(th.get());
-        min_fd = std::min<int>(min_fd, poller->fdCount() + poller->pendingFdCount());
+        min_fd = std::min<size_t>(min_fd, poller->fdCount() + poller->pendingFdCount());
     }
 
     // 阈值取绝对值与百分比中的较大者: 连接数少时允许一定绝对偏差, 连接数多时按比例放宽
