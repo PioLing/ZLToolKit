@@ -101,9 +101,23 @@ TcpServer::Ptr TcpServer::onCreatServer(const EventPoller::Ptr &poller) {
 
 Socket::Ptr TcpServer::onBeforeAcceptConnection(const EventPoller::Ptr &poller) {
     assert(_poller->isCurrentThread());
+    if (!_multi_poller) {
+        return createSocket(_poller);
+    }
     //此处改成自定义获取poller对象，防止负载不均衡  [AUTO-TRANSLATED:16c66457]
     //Modify this to a custom way of getting the poller object to prevent load imbalance
-    return createSocket(_multi_poller ? EventPollerPool::Instance().getPoller(false) : _poller);
+    // 选择poller与预约fd名额在同一临界区完成: 多个线程同时accept时, 后来者能看到先到者的预约, 避免同一批连接集中到一个poller
+    // Poller selection and fd reservation happen in one critical section: when several threads accept concurrently,
+    // later ones see earlier reservations so a burst does not pile onto one poller
+    std::shared_ptr<void> reservation;
+    auto target = EventPollerPool::Instance().getPollerAndReserveFd(reservation);
+    auto sock = createSocket(target);
+    if (sock) {
+        // 预约交由Socket持有, fd在目标线程注册完成后释放; sock为空则随reservation析构释放
+        // The Socket now holds the reservation until the fd is registered; if sock is null it is released with reservation
+        sock->reserveFd(std::move(reservation));
+    }
+    return sock;
 }
 
 void TcpServer::cloneFrom(const TcpServer &that) {

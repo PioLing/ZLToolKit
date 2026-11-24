@@ -433,6 +433,21 @@ public:
     EventPoller::Ptr getPoller(bool prefer_current_thread = true);
 
     /**
+     * 选择轻负载poller，并在同一临界区内于其上预约一个fd名额
+     * 选择与预约原子完成，并发派发时后来者能看到先到者的预约，避免同一批连接集中到同一个poller
+     * 仅供fd派发路径使用(TcpServer accept、UdpServer新建会话等)，预约应交由承载该fd的Socket持有(见Socket::reserveFd)
+     * 选择规则与 getPoller(false) 相同
+     * @param reservation [out] 预约句柄，析构时自动释放预约
+     * Select a lightly loaded poller and reserve an fd slot on it within one critical section.
+     * Selection and reservation are atomic, so concurrent dispatchers see each other's reservations and a
+     * burst does not pile onto a single poller. For fd-dispatch paths only (TcpServer accept, UdpServer
+     * session creation, ...); hand the reservation to the Socket carrying the fd (see Socket::reserveFd).
+     * Same selection rule as getPoller(false).
+     * @param reservation [out] reservation handle, released when destroyed
+     */
+    EventPoller::Ptr getPollerAndReserveFd(std::shared_ptr<void> &reservation);
+
+    /**
      * 设置 getPoller() 是否优先返回当前线程
      * 在批量创建Socket对象时，如果优先返回当前线程，
      * 那么将导致负载不够均衡，所以可以暂时关闭然后再开启
@@ -448,10 +463,12 @@ public:
     /**
      * 设置 getPoller() 判定"fd数相近"的阈值，实际阈值 = max(absolute, min_fd * percent / 100)
      * fd数在 [min_fd, min_fd + 阈值] 内的poller会进一步比较cpu负载
+     * 线程安全，可在运行期动态调整
      * @param absolute 绝对阈值(fd个数)
      * @param percent 相对阈值(百分比)
      * Set the threshold used by getPoller() to treat fd counts as "close": max(absolute, min_fd * percent / 100).
      * Pollers within [min_fd, min_fd + threshold] are further compared by cpu load.
+     * Thread-safe, may be changed at runtime.
      * @param absolute Absolute threshold in fds
      * @param percent Relative threshold in percent
      */
@@ -460,11 +477,20 @@ public:
 private:
     EventPollerPool();
 
+    /**
+     * 两级选择轻负载poller：fd数(含预约)最少者优先，fd数相近时比较cpu负载，起始位置轮转
+     * Two-stage selection: fewest fds (incl. reservations) first, cpu load among close ones, rotating start
+     */
+    EventPoller *selectPoller();
+
 private:
     bool _prefer_current_thread = true;
     std::atomic<size_t> _poller_pos { 0 };
-    size_t _fd_balance_threshold = 8;
-    size_t _fd_balance_threshold_percent = 10;
+    std::atomic<size_t> _fd_balance_threshold { 8 };
+    std::atomic<size_t> _fd_balance_threshold_percent { 10 };
+    // 串行化"选择+预约"，使并发派发者互相可见对方的预约
+    // Serializes select+reserve so concurrent dispatchers observe each other's reservations
+    std::mutex _reserve_mtx;
 };
 
 } // namespace toolkit

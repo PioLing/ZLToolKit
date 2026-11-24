@@ -427,13 +427,19 @@ public:
     std::shared_ptr<void> cloneSocket(const Socket &other);
 
     /**
-     * 在本Socket所属poller上预约一个fd名额(用于EventPollerPool::getPoller负载均衡)
-     * 仅在fd已确定派发到本Socket、但attach到事件循环被推迟时调用；attach时或Socket析构时自动释放
-     * Reserve an fd slot on this Socket's poller (used by EventPollerPool::getPoller for load balancing).
-     * Call only when an fd has been dispatched to this Socket but attaching is deferred;
-     * released automatically on attach or when the Socket is destroyed.
+     * 让本Socket持有一个poller fd名额预约(用于EventPollerPool负载均衡)
+     * 仅在fd已确定派发到本Socket、但注册到事件循环被推迟时调用
+     * 预约在fd于poller线程完成注册、获取fd失败(listen/bind失败等)或Socket析构时自动释放
+     * @param reservation 通过 EventPollerPool::getPollerAndReserveFd 取得、且属于本Socket所在poller的预约；
+     *                    为空则在本Socket所在poller上新建预约(已持有预约时不重复预约)
+     * Make this Socket hold an fd-slot reservation on its poller (for EventPollerPool load balancing).
+     * Call only when an fd has been dispatched to this Socket but registering it is deferred.
+     * Released automatically once the fd is registered on the poller thread, when acquiring the fd fails
+     * (listen/bind failure etc.) or when the Socket is destroyed.
+     * @param reservation reservation obtained via EventPollerPool::getPollerAndReserveFd for this Socket's poller;
+     *                    if empty, a new reservation is made on this Socket's poller (no-op if one is already held)
      */
-    void reserveFd();
+    void reserveFd(std::shared_ptr<void> reservation = nullptr);
 
     /**
      * 切换poller线程，注意只能在onAccept之前调用
@@ -773,6 +779,9 @@ private:
     void stopWriteAbleEvent(const SockNum::Ptr &sock);
     bool flushData(const SockNum::Ptr &sock, bool poller_thread);
     bool attachEvent(const SockNum::Ptr &sock);
+    // 放弃本Socket持有的fd预约(获取fd失败时调用)
+    // Drop the fd reservation held by this Socket (called when acquiring the fd fails)
+    void releaseFdReservation();
     ssize_t send_l(Buffer::Ptr buf, bool is_buf_sock, bool try_flush = true);
     void connect_l(const std::string &url, uint16_t port, const onErrCB &con_cb_in, float timeout_sec, const std::string &local_ip, uint16_t local_port);
     bool fromSock_l(SockNum::Ptr sock);
@@ -822,8 +831,8 @@ private:
     // 本socket绑定的poller线程，事件触发于此线程  [AUTO-TRANSLATED:6f782513]
     //The poller thread bound to this socket, events are triggered in this thread
     EventPoller::Ptr _poller;
-    // 在poller上预约的fd名额(见reserveFd)，fd添加到事件循环后释放，用于poller负载均衡
-    // fd slot reserved on the poller (see reserveFd) for load balancing; released once the fd is attached
+    // 在poller上预约的fd名额(见reserveFd)，fd在poller线程注册完成后释放，用于poller负载均衡
+    // fd slot reserved on the poller (see reserveFd) for load balancing; released once the fd is registered on the poller thread
     std::shared_ptr<void> _fd_reservation;
     // 跨线程访问_sock_fd时需要上锁  [AUTO-TRANSLATED:dc63f6c4]
     //Need to lock when accessing _sock_fd across threads

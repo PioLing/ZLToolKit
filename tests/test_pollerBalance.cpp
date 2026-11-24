@@ -2,6 +2,8 @@
 #include <atomic>
 #include <functional>
 #include <iostream>
+#include <mutex>
+#include <thread>
 #include <vector>
 #if defined(__linux) || defined(__linux__)
 #include <sys/socket.h>
@@ -24,22 +26,35 @@ public:
     void onManager() override {}
 };
 
-static int connectMany(int count, vector<int> &fds, int port) {
-    int ok = 0;
-    for (int i = 0; i < count; ++i) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in addr {};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (connect(fd, (sockaddr *)&addr, sizeof(addr)) == 0) {
-            fds.push_back(fd);
-            ++ok;
-        } else {
-            close(fd);
-        }
+// 多个客户端线程同时发起连接, 使多个poller线程并发accept并同时选择目标poller
+// Several client threads connect at once so that multiple poller threads accept and pick a target poller concurrently
+static int connectMany(int count, vector<int> &fds, int port, int client_threads = 4) {
+    mutex mtx;
+    vector<thread> workers;
+    for (int t = 0; t < client_threads; ++t) {
+        int n = count / client_threads + (t < count % client_threads ? 1 : 0);
+        workers.emplace_back([&, n]() {
+            vector<int> local;
+            for (int i = 0; i < n; ++i) {
+                int fd = socket(AF_INET, SOCK_STREAM, 0);
+                sockaddr_in addr {};
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(port);
+                addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                if (connect(fd, (sockaddr *)&addr, sizeof(addr)) == 0) {
+                    local.push_back(fd);
+                } else {
+                    close(fd);
+                }
+            }
+            lock_guard<mutex> lck(mtx);
+            fds.insert(fds.end(), local.begin(), local.end());
+        });
     }
-    return ok;
+    for (auto &w : workers) {
+        w.join();
+    }
+    return (int)fds.size();
 }
 
 static vector<EventPoller::Ptr> allPollers() {
@@ -117,9 +132,18 @@ int main(int argc, char *argv[]) {
     }
     cout << "stage2: new conns to busy=" << to_busy << " to idle=" << to_idle << endl;
 
+    // 所有fd都已注册, 预约应全部释放
+    // Every fd is registered by now, so no reservation may remain
+    size_t pending = 0;
+    for (auto &p : pollers) {
+        pending += p->pendingFdCount();
+    }
+    cout << "pending after settle=" << pending << endl;
+    int ret = pending == 0 ? 0 : 1;
+
     // 先停服务器再断开客户端, 等待poller处理完关闭事件后退出, 避免退出时的析构竞争
     server.reset();
     for (auto fd : fds) close(fd);
     this_thread::sleep_for(chrono::seconds(1));
-    return 0;
+    return ret;
 }

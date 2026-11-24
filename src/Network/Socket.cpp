@@ -12,7 +12,6 @@
 #include "sockutil.h"
 #include "Socket.h"
 #include "Util/util.h"
-#include "Util/onceToken.h"
 #include "Util/logger.h"
 #include "Util/uv_errno.h"
 #include "Thread/semaphore.h"
@@ -263,11 +262,29 @@ void Socket::onConnected(const SockNum::Ptr &sock, const onErrCB &cb) {
 }
 
 bool Socket::attachEvent(const SockNum::Ptr &sock) {
-    // fd即将计入poller的fdCount，预约使命完成(失败时也释放, 由调用方决定是否重试)
-    // The fd is about to be counted in the poller's fdCount; the reservation is done
-    // (released on failure too, retry is up to the caller)
-    onceToken token(nullptr, [this]() { _fd_reservation = nullptr; });
+    // 取走预约: 本函数返回(同步路径)或切换到poller线程的任务结束(异步路径)时释放;
+    // 届时fd已计入poller的fdCount或已明确失败(失败时由调用方决定是否重试)
+    // Take the reservation: it is released when this function returns (sync path) or when the task
+    // hopped to the poller thread finishes (async path); by then the fd is counted in fdCount or has failed
+    std::shared_ptr<void> reservation;
+    {
+        LOCK_GUARD(_mtx_sock_fd);
+        reservation = std::move(_fd_reservation);
+    }
     weak_ptr<Socket> weak_self = shared_from_this();
+    if (!_poller->isCurrentThread()) {
+        // 非poller线程: addEvent只会排队, fd此时既不在fdCount也不在pendingFdCount, 故把预约随任务带到poller线程,
+        // 直到注册真正完成才释放; 任务被丢弃(poller退出/Socket已析构)时也随之释放
+        // Off the poller thread addEvent would merely enqueue, leaving the fd in neither fdCount nor pendingFdCount,
+        // so carry the reservation along with the task and release it only once registration is done
+        // (or the task is dropped because the poller exited / the Socket was destroyed)
+        _poller->async([weak_self, sock, reservation]() {
+            if (auto strong_self = weak_self.lock()) {
+                strong_self->attachEvent(sock);
+            }
+        });
+        return true;
+    }
     if (sock->type() == SockNum::Sock_TCP_Server) {
         // tcp服务器  [AUTO-TRANSLATED:f4b9757f]
         //TCP server
@@ -552,6 +569,7 @@ bool Socket::listen(uint16_t port, const string &local_ip, int backlog) {
     closeSock();
     int fd = SockUtil::listen(port, local_ip.data(), backlog);
     if (fd == -1) {
+        releaseFdReservation();
         return false;
     }
     return fromSock_l(std::make_shared<SockNum>(fd, SockNum::Sock_TCP_Server));
@@ -561,6 +579,7 @@ bool Socket::bindUdpSock(uint16_t port, const string &local_ip, bool enable_reus
     closeSock();
     int fd = SockUtil::bindUdpSock(port, local_ip.data(), enable_reuse);
     if (fd == -1) {
+        releaseFdReservation();
         return false;
     }
     return fromSock_l(std::make_shared<SockNum>(fd, SockNum::Sock_UDP));
@@ -582,9 +601,18 @@ bool Socket::fromSock_l(SockNum::Ptr sock) {
     return true;
 }
 
-void Socket::reserveFd() {
+void Socket::reserveFd(std::shared_ptr<void> reservation) {
     LOCK_GUARD(_mtx_sock_fd);
-    _fd_reservation = _poller->reserveFd();
+    if (reservation) {
+        _fd_reservation = std::move(reservation);
+    } else if (!_fd_reservation) {
+        _fd_reservation = _poller->reserveFd();
+    }
+}
+
+void Socket::releaseFdReservation() {
+    LOCK_GUARD(_mtx_sock_fd);
+    _fd_reservation = nullptr;
 }
 
 void Socket::moveTo(EventPoller::Ptr poller) {
@@ -678,7 +706,9 @@ int Socket::onAccept(const SockNum::Ptr &sock, int event) noexcept {
                 peer_sock = Socket::createSocket(_poller, false);
             }
             // fd派发到peer_sock所属poller, attach被推迟到onAccept回调之后, 先预约名额以便负载均衡
-            // The fd is dispatched to peer_sock's poller with attach deferred until after onAccept; reserve a slot for load balancing
+            // (若_on_before_accept已随poller选择一并预约, 此处不重复预约)
+            // The fd is dispatched to peer_sock's poller with attach deferred until after onAccept; reserve a slot for
+            // load balancing (no-op if _on_before_accept already reserved one together with the poller selection)
             peer_sock->reserveFd();
 
             auto sock = std::make_shared<SockNum>(fd, SockNum::Sock_TCP);

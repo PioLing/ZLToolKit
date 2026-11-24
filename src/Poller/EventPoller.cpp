@@ -705,7 +705,17 @@ EventPoller::Ptr EventPollerPool::getPoller(bool prefer_current_thread) {
     if (prefer_current_thread && _prefer_current_thread && poller) {
         return poller;
     }
+    return static_pointer_cast<EventPoller>(selectPoller()->shared_from_this());
+}
 
+EventPoller::Ptr EventPollerPool::getPollerAndReserveFd(std::shared_ptr<void> &reservation) {
+    lock_guard<mutex> lck(_reserve_mtx);
+    auto poller = selectPoller();
+    reservation = poller->reserveFd();
+    return static_pointer_cast<EventPoller>(poller->shared_from_this());
+}
+
+EventPoller *EventPollerPool::selectPoller() {
     auto size = _threads.size();
 
     // 两级选择:
@@ -732,7 +742,9 @@ EventPoller::Ptr EventPollerPool::getPoller(bool prefer_current_thread) {
 
     // 阈值取绝对值与百分比中的较大者: 连接数少时允许一定绝对偏差, 连接数多时按比例放宽
     // Threshold is the larger of the absolute and the percentage value
-    auto threshold = std::max<size_t>(_fd_balance_threshold, min_fd * _fd_balance_threshold_percent / 100);
+    auto absolute = _fd_balance_threshold.load(std::memory_order_relaxed);
+    auto percent = _fd_balance_threshold_percent.load(std::memory_order_relaxed);
+    auto threshold = std::max<size_t>(absolute, min_fd * percent / 100);
 
     // 第二遍: 仅对fd数相近的候选调用load()(有锁), 避免每次accept都遍历所有线程的负载记录
     // Pass 2: call load() (which locks) only for close candidates
@@ -754,12 +766,12 @@ EventPoller::Ptr EventPollerPool::getPoller(bool prefer_current_thread) {
         // fd counts grew between the passes leaving no candidate (rare); fall back to round-robin
         best = static_cast<EventPoller *>(_threads[start].get());
     }
-    return static_pointer_cast<EventPoller>(best->shared_from_this());
+    return best;
 }
 
 void EventPollerPool::setFdBalanceThreshold(size_t absolute, size_t percent) {
-    _fd_balance_threshold = absolute;
-    _fd_balance_threshold_percent = percent;
+    _fd_balance_threshold.store(absolute, std::memory_order_relaxed);
+    _fd_balance_threshold_percent.store(percent, std::memory_order_relaxed);
 }
 
 void EventPollerPool::preferCurrentThread(bool flag) {

@@ -255,15 +255,20 @@ SessionHelper::Ptr UdpServer::getOrCreateSession(const UdpServer::PeerIdType &id
 SessionHelper::Ptr UdpServer::createSession(const PeerIdType &id, Buffer::Ptr &buf, struct sockaddr *addr, int addr_len) {
     // 此处改成自定义获取poller对象，防止负载不均衡  [AUTO-TRANSLATED:194e8460]
     //Change to custom acquisition of poller objects to prevent load imbalance
-    auto socket = createSocket(_multi_poller ? EventPollerPool::Instance().getPoller(false) : _poller, buf, addr, addr_len);
+    // 选择poller与预约fd名额在同一临界区完成(多个UdpServer线程可能同时新建会话); socket的bind/attach在其poller线程异步执行,
+    // 预约由socket持有至注册完成, 以便期间的负载均衡计数准确
+    // Poller selection and fd reservation happen in one critical section (several UdpServer threads may create sessions
+    // concurrently); bind/attach runs asynchronously on the socket's poller, so the socket holds the reservation until
+    // registration is done to keep the load-balance count accurate meanwhile
+    std::shared_ptr<void> reservation;
+    auto poller = _multi_poller ? EventPollerPool::Instance().getPollerAndReserveFd(reservation) : _poller;
+    auto socket = createSocket(poller, buf, addr, addr_len);
     if (!socket) {
         //创建socket失败，本次onRead事件收到的数据直接丢弃  [AUTO-TRANSLATED:b218d68c]
         //Socket creation failed, the data received by this onRead event is discarded
         return nullptr;
     }
-    // socket的bind/attach在其poller线程异步执行, 先预约名额以便负载均衡
-    // bind/attach runs asynchronously on the socket's poller; reserve a slot for load balancing
-    socket->reserveFd();
+    socket->reserveFd(std::move(reservation));
 
     auto addr_str = string((char *) addr, addr_len);
     std::weak_ptr<UdpServer> weak_self = std::static_pointer_cast<UdpServer>(shared_from_this());
@@ -282,7 +287,13 @@ SessionHelper::Ptr UdpServer::createSession(const PeerIdType &id, Buffer::Ptr &b
         }
 
         assert(_socket);
-        socket->bindUdpSock(_socket->get_local_port(), _socket->get_local_ip());
+        if (!socket->bindUdpSock(_socket->get_local_port(), _socket->get_local_ip())) {
+            // bind失败(端口被占用/fd耗尽等): 不创建会话, 本次数据丢弃; bindUdpSock失败时已释放fd预约
+            // Bind failed (port in use / out of fds ...): create no session and drop this packet;
+            // bindUdpSock has already released the fd reservation
+            WarnL << "Bind udp socket for peer session failed: " << get_uv_errmsg(true);
+            return nullptr;
+        }
         socket->bindPeerAddr((struct sockaddr *) addr_str.data(), addr_str.size());
 
         auto helper = _session_alloc(server, socket);
