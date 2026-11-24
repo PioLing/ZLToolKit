@@ -13,6 +13,7 @@
 #endif
 #include "Util/logger.h"
 #include "Network/TcpServer.h"
+#include "Network/UdpServer.h"
 #include "Network/Session.h"
 
 using namespace std;
@@ -55,6 +56,62 @@ static int connectMany(int count, vector<int> &fds, int port, int client_threads
         w.join();
     }
     return (int)fds.size();
+}
+
+// 多个客户端线程各自用独立的udp socket(不同源端口)向服务器各发一个数据包:
+// 每个新peer都会触发UdpServer新建会话并在所选poller上创建一个peer fd;
+// 内核按reuseport哈希把首包分散到各poller的server fd, 因此多个poller线程会并发选择目标poller
+// Several client threads each send one datagram from their own udp sockets (distinct source ports):
+// every new peer makes UdpServer create a session with one peer fd on the chosen poller; the kernel spreads
+// first packets over the per-poller server fds (reuseport hash), so multiple poller threads select concurrently
+static int sendManyUdp(int count, vector<int> &fds, int port, int client_threads = 4) {
+    mutex mtx;
+    vector<thread> workers;
+    for (int t = 0; t < client_threads; ++t) {
+        int n = count / client_threads + (t < count % client_threads ? 1 : 0);
+        workers.emplace_back([&, n]() {
+            vector<int> local;
+            for (int i = 0; i < n; ++i) {
+                int fd = socket(AF_INET, SOCK_DGRAM, 0);
+                sockaddr_in addr {};
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(port);
+                addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                // connect后获得独立源端口, 且对端不可达时能收到错误而不是静默丢弃
+                // connect assigns a distinct source port and surfaces unreachable errors instead of silent drops
+                if (connect(fd, (sockaddr *)&addr, sizeof(addr)) == 0 && send(fd, "ping", 4, 0) == 4) {
+                    local.push_back(fd);
+                } else {
+                    close(fd);
+                }
+                // 略微限速, 避免首包在server fd接收缓冲区溢出被内核丢弃(小核数机器上8个poller来不及消费)
+                // Pace slightly so first packets are not dropped by the kernel when the server fds' receive
+                // buffers overflow (on few-core machines the pollers cannot drain a burst fast enough)
+                if ((i & 15) == 15) {
+                    this_thread::sleep_for(chrono::milliseconds(1));
+                }
+            }
+            lock_guard<mutex> lck(mtx);
+            fds.insert(fds.end(), local.begin(), local.end());
+        });
+    }
+    for (auto &w : workers) {
+        w.join();
+    }
+    return (int)fds.size();
+}
+
+// 统计收到回显的udp客户端数, 即实际建立了会话(peer fd)的peer数
+// Count udp clients that got an echo, i.e. peers for which a session (peer fd) was actually created
+static size_t countEchoed(const vector<int> &fds) {
+    size_t echoed = 0;
+    char buf[16];
+    for (auto fd : fds) {
+        if (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+            ++echoed;
+        }
+    }
+    return echoed;
 }
 
 static vector<EventPoller::Ptr> allPollers() {
@@ -134,16 +191,60 @@ int main(int argc, char *argv[]) {
 
     // 所有fd都已注册, 预约应全部释放
     // Every fd is registered by now, so no reservation may remain
-    size_t pending = 0;
-    for (auto &p : pollers) {
-        pending += p->pendingFdCount();
-    }
+    auto pendingTotal = [&]() {
+        size_t pending = 0;
+        for (auto &p : pollers) {
+            pending += p->pendingFdCount();
+        }
+        return pending;
+    };
+    auto pending = pendingTotal();
     cout << "pending after settle=" << pending << endl;
     int ret = pending == 0 ? 0 : 1;
 
+    // 阶段3: udp; 每个新peer在所选poller上新建一个peer fd, 突发时同样应按fd数均分
+    // Stage 3: udp; each new peer adds one peer fd on the chosen poller, a burst should likewise be split evenly
+    this_thread::sleep_for(chrono::seconds(1));
+    before.clear();
+    for (auto &p : pollers) {
+        before.push_back(p->fdCount());
+    }
+    UdpServer::Ptr udp_server(new UdpServer());
+    udp_server->start<EchoSession>(0, "127.0.0.1");
+    vector<int> udp_fds;
+    int udp_peers = conns / 2;
+    sendManyUdp(udp_peers, udp_fds, udp_server->getPort());
+    this_thread::sleep_for(chrono::seconds(1));
+
+    // 均衡的是poller的fd总数而非本阶段增量: 阶段2中忙碌poller分到的tcp连接较少, 这里会相应多分到一些udp peer
+    // What gets balanced is each poller's total fd count, not this stage's delta: pollers kept busy in stage 2
+    // received fewer tcp connections and are therefore handed somewhat more udp peers here
+    size_t udp_total = 0;
+    maxv = 0, minv = SIZE_MAX;
+    for (size_t i = 0; i < pollers.size(); ++i) {
+        auto n = pollers[i]->fdCount();
+        // 每个poller额外持有一个udp server fd
+        // Each poller also holds one udp server fd
+        udp_total += n - before[i] - 1;
+        maxv = max(maxv, n);
+        minv = min(minv, n);
+        cout << pollers[i]->getThreadName() << ": fd=" << n << " (udp peer +" << n - before[i] - 1 << ") pending=" << pollers[i]->pendingFdCount() << endl;
+    }
+    pending = pendingTotal();
+    auto echoed = countEchoed(udp_fds);
+    cout << "stage3(udp): sent=" << udp_fds.size() << " echoed=" << echoed << " peer_fd=" << udp_total
+         << " total fd max=" << maxv << " min=" << minv << " pending=" << pending << endl;
+    // 每个建立了会话的peer恰好对应一个已注册的peer fd, 且预约全部释放
+    // Every peer with a session maps to exactly one registered peer fd, and no reservation remains
+    if (pending != 0 || udp_total != echoed) {
+        ret = 1;
+    }
+
     // 先停服务器再断开客户端, 等待poller处理完关闭事件后退出, 避免退出时的析构竞争
     server.reset();
+    udp_server.reset();
     for (auto fd : fds) close(fd);
+    for (auto fd : udp_fds) close(fd);
     this_thread::sleep_for(chrono::seconds(1));
     return ret;
 }
