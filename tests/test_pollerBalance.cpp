@@ -12,6 +12,7 @@
 #include <unistd.h>
 #endif
 #include "Util/logger.h"
+#include "Util/uv_errno.h"
 #include "Network/TcpServer.h"
 #include "Network/UdpServer.h"
 #include "Network/Session.h"
@@ -103,15 +104,30 @@ static int sendManyUdp(int count, vector<int> &fds, int port, int client_threads
 
 // 统计收到回显的udp客户端数, 即实际建立了会话(peer fd)的peer数
 // Count udp clients that got an echo, i.e. peers for which a session (peer fd) was actually created
-static size_t countEchoed(const vector<int> &fds) {
-    size_t echoed = 0;
+static bool countEchoed(const vector<int> &fds, size_t &echoed) {
+    echoed = 0;
+    bool success = true;
     char buf[16];
     for (auto fd : fds) {
-        if (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+        if (SockUtil::setNoBlocked(fd) != 0) {
+            cerr << "failed to set UDP socket nonblocking: " << get_uv_errmsg(true) << endl;
+            success = false;
+            continue;
+        }
+        int received;
+        int error = 0;
+        do {
+            received = recv(fd, buf, sizeof(buf), 0);
+            error = received < 0 ? get_uv_error(true) : 0;
+        } while (error == UV_EINTR);
+        if (received > 0) {
             ++echoed;
+        } else if (received < 0 && error != UV_EAGAIN) {
+            cerr << "failed to receive UDP echo: " << uv_strerror(error) << endl;
+            success = false;
         }
     }
-    return echoed;
+    return success;
 }
 
 static vector<EventPoller::Ptr> allPollers() {
@@ -231,12 +247,13 @@ int main(int argc, char *argv[]) {
         cout << pollers[i]->getThreadName() << ": fd=" << n << " (udp peer +" << n - before[i] - 1 << ") pending=" << pollers[i]->pendingFdCount() << endl;
     }
     pending = pendingTotal();
-    auto echoed = countEchoed(udp_fds);
+    size_t echoed = 0;
+    auto echo_count_ok = countEchoed(udp_fds, echoed);
     cout << "stage3(udp): sent=" << udp_fds.size() << " echoed=" << echoed << " peer_fd=" << udp_total
          << " total fd max=" << maxv << " min=" << minv << " pending=" << pending << endl;
     // 每个建立了会话的peer恰好对应一个已注册的peer fd, 且预约全部释放
     // Every peer with a session maps to exactly one registered peer fd, and no reservation remains
-    if (pending != 0 || udp_total != echoed) {
+    if (!echo_count_ok || pending != 0 || udp_total != echoed) {
         ret = 1;
     }
 
