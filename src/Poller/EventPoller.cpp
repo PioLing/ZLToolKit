@@ -732,7 +732,7 @@ EventPoller::Ptr EventPollerPool::getPoller(bool prefer_current_thread) {
     if (prefer_current_thread && _prefer_current_thread && poller) {
         return poller;
     }
-    return static_pointer_cast<EventPoller>(selectPoller()->shared_from_this());
+    return selectPoller();
 }
 
 EventPoller::Ptr EventPollerPool::getPollerAndReserveFd(std::shared_ptr<void> &reservation) {
@@ -742,20 +742,20 @@ EventPoller::Ptr EventPollerPool::getPollerAndReserveFd(std::shared_ptr<void> &r
     // means a concurrent dispatcher reserved on (or released from) that poller, so reselecting sees the fresh
     // count. Every failed CAS implies progress by another thread, hence lock-free overall; under extreme
     // contention the retries are bounded and we fall back to an unconditional reservation
-    EventPoller *poller = nullptr;
+    EventPoller::Ptr poller = nullptr;
     for (int i = 0; i < 8; ++i) {
         size_t observed_pending = 0;
         poller = selectPoller(&observed_pending);
         reservation = poller->tryReserveFd(observed_pending);
         if (reservation) {
-            return static_pointer_cast<EventPoller>(poller->shared_from_this());
+            return poller;
         }
     }
     reservation = poller->reserveFd();
-    return static_pointer_cast<EventPoller>(poller->shared_from_this());
+    return poller;
 }
 
-EventPoller *EventPollerPool::selectPoller(size_t *observed_pending) {
+EventPoller::Ptr EventPollerPool::selectPoller(size_t *observed_pending) {
     auto size = _threads.size();
 
     // 两级选择:
@@ -789,19 +789,22 @@ EventPoller *EventPollerPool::selectPoller(size_t *observed_pending) {
     // 第二遍: 在fd数相近的候选中比较cpu负载; 负载取短暂缓存值(见cachedLoad), 使整个选择过程几乎只有原子读
     // Pass 2: compare cpu load among close candidates; the load is a briefly cached value (see cachedLoad),
     // so the whole selection is nearly just atomic reads
-    EventPoller *best = nullptr;
+    EventPoller::Ptr best = nullptr;
+    size_t best_index = start;
     int best_load = 0;
     size_t best_pending = 0;
     auto now_ms = getCurrentMillisecond();
     for (size_t i = 0; i < size; ++i) {
-        auto poller = static_cast<EventPoller *>(_threads[(start + i) % size].get());
+        auto index = (start + i) % size;
+        auto poller = static_pointer_cast<EventPoller>(_threads[index]);
         auto pending = poller->pendingFdCount();
         if (poller->fdCount() + pending > min_fd + threshold) {
             continue;
         }
         auto load = poller->cachedLoad(now_ms);
         if (!best || load < best_load) {
-            best = poller;
+            best = static_pointer_cast<EventPoller>(_threads[index]);
+            best_index = index;
             best_load = load;
             best_pending = pending;
         }
@@ -809,13 +812,13 @@ EventPoller *EventPollerPool::selectPoller(size_t *observed_pending) {
     if (!best) {
         // fd数在两遍之间增长导致无候选(极少见), 退化为轮询
         // fd counts grew between the passes leaving no candidate (rare); fall back to round-robin
-        best = static_cast<EventPoller *>(_threads[start].get());
+        best = static_pointer_cast<EventPoller>(_threads[start]);
         best_pending = best->pendingFdCount();
     }
     if (observed_pending) {
         *observed_pending = best_pending;
     }
-    return best;
+    return static_pointer_cast<EventPoller>(_threads[best_index]);
 }
 
 void EventPollerPool::setFdBalanceThreshold(size_t absolute, size_t percent) {

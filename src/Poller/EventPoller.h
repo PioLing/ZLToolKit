@@ -507,7 +507,7 @@ private:
      * Two-stage selection: fewest fds (incl. reservations) first, cpu load among close ones, rotating start
      * @param observed_pending [out] pending count of the chosen poller as observed during selection, for the tryReserveFd CAS
      */
-    EventPoller *selectPoller(size_t *observed_pending = nullptr);
+    EventPoller::Ptr selectPoller(size_t *observed_pending = nullptr);
 
 private:
     bool _prefer_current_thread = true;
