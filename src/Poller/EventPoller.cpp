@@ -320,6 +320,33 @@ size_t EventPoller::pendingFdCount() const {
 
 std::shared_ptr<void> EventPoller::reserveFd() {
     _pending_fd_count.fetch_add(1, std::memory_order_relaxed);
+    return makeFdReservation();
+}
+
+std::shared_ptr<void> EventPoller::tryReserveFd(size_t expected_pending) {
+    if (!_pending_fd_count.compare_exchange_strong(expected_pending, expected_pending + 1, std::memory_order_relaxed)) {
+        return nullptr;
+    }
+    return makeFdReservation();
+}
+
+// selectPoller读取cpu负载的缓存时长(毫秒)
+// How long (ms) selectPoller may reuse a cached cpu load
+static constexpr uint64_t kLoadCacheMs = 100;
+
+int EventPoller::cachedLoad(uint64_t now_ms) {
+    auto stamp = _cached_load_stamp.load(std::memory_order_relaxed);
+    if (now_ms - stamp >= kLoadCacheMs) {
+        // 多个线程同时发现过期时只由抢到时间戳的那个刷新, 其余沿用旧值
+        // When several threads see it expired only the one that wins the stamp refreshes, the rest reuse the old value
+        if (_cached_load_stamp.compare_exchange_strong(stamp, now_ms, std::memory_order_relaxed)) {
+            _cached_load.store(load(), std::memory_order_relaxed);
+        }
+    }
+    return _cached_load.load(std::memory_order_relaxed);
+}
+
+std::shared_ptr<void> EventPoller::makeFdReservation() {
     std::weak_ptr<EventPoller> weak_self = shared_from_this();
     // 0x01无实际意义，仅作为非空句柄
     return std::shared_ptr<void>(reinterpret_cast<void *>(0x01), [weak_self](void *) {
@@ -709,13 +736,26 @@ EventPoller::Ptr EventPollerPool::getPoller(bool prefer_current_thread) {
 }
 
 EventPoller::Ptr EventPollerPool::getPollerAndReserveFd(std::shared_ptr<void> &reservation) {
-    lock_guard<mutex> lck(_reserve_mtx);
-    auto poller = selectPoller();
+    // 无锁的"选择+预约": 以选择时观测到的预约数为期望值CAS提交; 失败说明有并发派发者已在该poller上预约(或预约被释放),
+    // 此时重选即可看到最新计数。CAS失败即意味着其它线程取得了进展, 因此整体无锁; 极端争用下限制重试次数, 退化为直接预约
+    // Lock-free select+reserve: commit with a CAS against the pending count observed during selection. A failure
+    // means a concurrent dispatcher reserved on (or released from) that poller, so reselecting sees the fresh
+    // count. Every failed CAS implies progress by another thread, hence lock-free overall; under extreme
+    // contention the retries are bounded and we fall back to an unconditional reservation
+    EventPoller *poller = nullptr;
+    for (int i = 0; i < 8; ++i) {
+        size_t observed_pending = 0;
+        poller = selectPoller(&observed_pending);
+        reservation = poller->tryReserveFd(observed_pending);
+        if (reservation) {
+            return static_pointer_cast<EventPoller>(poller->shared_from_this());
+        }
+    }
     reservation = poller->reserveFd();
     return static_pointer_cast<EventPoller>(poller->shared_from_this());
 }
 
-EventPoller *EventPollerPool::selectPoller() {
+EventPoller *EventPollerPool::selectPoller(size_t *observed_pending) {
     auto size = _threads.size();
 
     // 两级选择:
@@ -746,25 +786,34 @@ EventPoller *EventPollerPool::selectPoller() {
     auto percent = _fd_balance_threshold_percent.load(std::memory_order_relaxed);
     auto threshold = std::max<size_t>(absolute, min_fd * percent / 100);
 
-    // 第二遍: 仅对fd数相近的候选调用load()(有锁), 避免每次accept都遍历所有线程的负载记录
-    // Pass 2: call load() (which locks) only for close candidates
+    // 第二遍: 在fd数相近的候选中比较cpu负载; 负载取短暂缓存值(见cachedLoad), 使整个选择过程几乎只有原子读
+    // Pass 2: compare cpu load among close candidates; the load is a briefly cached value (see cachedLoad),
+    // so the whole selection is nearly just atomic reads
     EventPoller *best = nullptr;
     int best_load = 0;
+    size_t best_pending = 0;
+    auto now_ms = getCurrentMillisecond();
     for (size_t i = 0; i < size; ++i) {
         auto poller = static_cast<EventPoller *>(_threads[(start + i) % size].get());
-        if (poller->fdCount() + poller->pendingFdCount() > min_fd + threshold) {
+        auto pending = poller->pendingFdCount();
+        if (poller->fdCount() + pending > min_fd + threshold) {
             continue;
         }
-        auto load = poller->load();
+        auto load = poller->cachedLoad(now_ms);
         if (!best || load < best_load) {
             best = poller;
             best_load = load;
+            best_pending = pending;
         }
     }
     if (!best) {
         // fd数在两遍之间增长导致无候选(极少见), 退化为轮询
         // fd counts grew between the passes leaving no candidate (rare); fall back to round-robin
         best = static_cast<EventPoller *>(_threads[start].get());
+        best_pending = best->pendingFdCount();
+    }
+    if (observed_pending) {
+        *observed_pending = best_pending;
     }
     return best;
 }

@@ -50,6 +50,7 @@ namespace toolkit {
 class EventPoller : public TaskExecutor, public AnyStorage, public std::enable_shared_from_this<EventPoller> {
 public:
     friend class TaskExecutorGetterImp;
+    friend class EventPollerPool;
 
     using Ptr = std::shared_ptr<EventPoller>;
     using PollEventCB = std::function<void(int event)>;
@@ -310,6 +311,27 @@ private:
     std::atomic<size_t> _fd_count { 0 };
     // 已预约但尚未attach的fd数, 由reserveFd()返回对象的生命周期维护
     std::atomic<size_t> _pending_fd_count { 0 };
+
+    /**
+     * 仅当当前预约数仍等于expected_pending时预约(CAS), 否则返回空
+     * 供EventPollerPool无锁地把"选择poller"与"预约"组合成一次原子提交: 若选择期间别的派发者已在本poller上预约, 则提交失败由调用方重选
+     * Reserve only if the pending count still equals expected_pending (CAS), else return null.
+     * Lets EventPollerPool combine "select poller" and "reserve" into one atomic commit without a lock:
+     * if another dispatcher reserved on this poller meanwhile the commit fails and the caller reselects
+     */
+    std::shared_ptr<void> tryReserveFd(size_t expected_pending);
+    std::shared_ptr<void> makeFdReservation();
+
+    /**
+     * 供EventPollerPool选择poller时读取的cpu负载, 至多每kLoadCacheMs刷新一次
+     * load()需加锁遍历负载记录, 并与本poller每次epoll_wait前后的记录操作争锁; 负载本身是秒级窗口的滞后指标, 短暂缓存不影响均衡
+     * Cpu load for EventPollerPool's selection, refreshed at most once per kLoadCacheMs.
+     * load() locks and walks the load records and contends with this poller's own bookkeeping around every
+     * epoll_wait; the load is a lagging seconds-window metric anyway, so a short cache does not hurt balancing
+     */
+    int cachedLoad(uint64_t now_ms);
+    std::atomic<int> _cached_load { 0 };
+    std::atomic<uint64_t> _cached_load_stamp { 0 };
     // 线程名  [AUTO-TRANSLATED:f1d62d9f]
     // 线程名
     // Thread name
@@ -433,15 +455,17 @@ public:
     EventPoller::Ptr getPoller(bool prefer_current_thread = true);
 
     /**
-     * 选择轻负载poller，并在同一临界区内于其上预约一个fd名额
-     * 选择与预约原子完成，并发派发时后来者能看到先到者的预约，避免同一批连接集中到同一个poller
+     * 选择轻负载poller并在其上预约一个fd名额, 两步作为一次原子提交(无锁, CAS)
+     * 若选择期间其它派发者已在所选poller上预约, 则提交失败并重选, 因此并发派发时后来者总能看到先到者的预约,
+     * 避免同一批连接集中到同一个poller
      * 仅供fd派发路径使用(TcpServer accept、UdpServer新建会话等)，预约应交由承载该fd的Socket持有(见Socket::reserveFd)
      * 选择规则与 getPoller(false) 相同
      * @param reservation [out] 预约句柄，析构时自动释放预约
-     * Select a lightly loaded poller and reserve an fd slot on it within one critical section.
-     * Selection and reservation are atomic, so concurrent dispatchers see each other's reservations and a
-     * burst does not pile onto a single poller. For fd-dispatch paths only (TcpServer accept, UdpServer
-     * session creation, ...); hand the reservation to the Socket carrying the fd (see Socket::reserveFd).
+     * Select a lightly loaded poller and reserve an fd slot on it as one atomic commit (lock-free, CAS).
+     * If another dispatcher reserved on the chosen poller meanwhile the commit fails and selection is redone,
+     * so concurrent dispatchers always see each other's reservations and a burst does not pile onto a single
+     * poller. For fd-dispatch paths only (TcpServer accept, UdpServer session creation, ...); hand the
+     * reservation to the Socket carrying the fd (see Socket::reserveFd).
      * Same selection rule as getPoller(false).
      * @param reservation [out] reservation handle, released when destroyed
      */
@@ -479,18 +503,17 @@ private:
 
     /**
      * 两级选择轻负载poller：fd数(含预约)最少者优先，fd数相近时比较cpu负载，起始位置轮转
+     * @param observed_pending [out] 选中poller在选择时刻的预约数, 用于tryReserveFd的CAS提交
      * Two-stage selection: fewest fds (incl. reservations) first, cpu load among close ones, rotating start
+     * @param observed_pending [out] pending count of the chosen poller as observed during selection, for the tryReserveFd CAS
      */
-    EventPoller *selectPoller();
+    EventPoller *selectPoller(size_t *observed_pending = nullptr);
 
 private:
     bool _prefer_current_thread = true;
     std::atomic<size_t> _poller_pos { 0 };
     std::atomic<size_t> _fd_balance_threshold { 8 };
     std::atomic<size_t> _fd_balance_threshold_percent { 10 };
-    // 串行化"选择+预约"，使并发派发者互相可见对方的预约
-    // Serializes select+reserve so concurrent dispatchers observe each other's reservations
-    std::mutex _reserve_mtx;
 };
 
 } // namespace toolkit
